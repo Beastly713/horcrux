@@ -3,7 +3,6 @@ package sharding
 import (
 	"bytes"
 	"fmt"
-	"io"
 
 	"github.com/klauspost/reedsolomon"
 )
