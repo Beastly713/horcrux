@@ -33,14 +33,12 @@ func NewSplitter(total, threshold int) (*Splitter, error) {
 // using Reed-Solomon erasure coding.
 func (s *Splitter) Split(data []byte) ([][]Shard, error) {
 	// Create the encoder
-	// Data shards = Threshold (T)
-	// Parity shards = Total (N) - Threshold (T)
 	enc, err := reedsolomon.New(s.Threshold, s.Total-s.Threshold)
 	if err != nil {
 		return nil, err
 	}
 
-	// Split the data into equal parts. The library handles padding if necessary.
+	// Split the data into equal parts.
 	shardsBytes, err := enc.Split(data)
 	if err != nil {
 		return nil, err
@@ -62,8 +60,7 @@ func (s *Splitter) Split(data []byte) ([][]Shard, error) {
 	return result, nil
 }
 
-// Join reverses the Split process. It requires a map where key=index, value=data.
-// It can reconstruct the original data as long as len(shards) >= Threshold.
+// Join reverses the Split process.
 func (s *Splitter) Join(shards map[int][]byte, originalSize int) ([]byte, error) {
 	enc, err := reedsolomon.New(s.Threshold, s.Total-s.Threshold)
 	if err != nil {
@@ -71,10 +68,10 @@ func (s *Splitter) Join(shards map[int][]byte, originalSize int) ([]byte, error)
 	}
 
 	// Prepare the slice for the library.
-	// We need a slice of size Total, where missing shards are nil.
 	reconstructShards := make([][]byte, s.Total)
 	validCount := 0
 
+	// Populate the shards we have
 	for i := 0; i < s.Total; i++ {
 		if data, ok := shards[i]; ok {
 			reconstructShards[i] = data
@@ -87,16 +84,31 @@ func (s *Splitter) Join(shards map[int][]byte, originalSize int) ([]byte, error)
 	}
 
 	// Reconstruct the missing data shards
-	// Note: We verify=true to ensure integrity of the data we DO have
 	if err := enc.Reconstruct(reconstructShards); err != nil {
 		return nil, fmt.Errorf("reconstruction failed: %w", err)
 	}
 
-	// Join the data shards back into one buffer
+	// MANUAL JOIN: Concatenate the data shards directly.
+	// This avoids ambiguity with the library's Join function when size is unknown.
 	var buf bytes.Buffer
-	if err := enc.Join(&buf, reconstructShards, originalSize); err != nil {
-		return nil, err
+	for i := 0; i < s.Threshold; i++ {
+		if len(reconstructShards[i]) == 0 {
+			return nil, fmt.Errorf("unexpected empty shard at index %d", i)
+		}
+		buf.Write(reconstructShards[i])
 	}
 
-	return buf.Bytes(), nil
+	joined := buf.Bytes()
+
+	// If originalSize is provided (non-zero), we strip the padding.
+	// In the Pipeline logic, we pass 0, so we return the full padded data.
+	// The Pipeline then uses the Length Prefix to strip it accurately.
+	if originalSize > 0 {
+		if len(joined) < originalSize {
+			return nil, fmt.Errorf("reconstructed data shorter than expected size")
+		}
+		joined = joined[:originalSize]
+	}
+
+	return joined, nil
 }
