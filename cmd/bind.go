@@ -1,14 +1,19 @@
 package cmd
 
 import (
+	"bytes"
 	"fmt"
+	"image"
+	_ "image/png" // Register PNG decoder
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/Beastly713/horcrux/pkg/format"
 	"github.com/Beastly713/horcrux/pkg/pipeline"
 	"github.com/Beastly713/horcrux/pkg/shamir"
+	"github.com/Beastly713/horcrux/pkg/stego"
 	"github.com/spf13/cobra"
 )
 
@@ -21,8 +26,9 @@ var (
 var bindCmd = &cobra.Command{
 	Use:   "bind [directory]",
 	Short: "Reconstruct the original file from a set of horcruxes",
-	Long: `Bind looks for .horcrux files in the specified directory (or current directory if not provided),
-validates them, and attempts to reconstruct the original file.
+	Long: `Bind looks for .horcrux and .png files in the specified directory 
+(or current directory if not provided), validates them, and attempts to 
+reconstruct the original file.
 
 You need at least T (threshold) valid horcruxes to succeed.`,
 	Args: cobra.MaximumNArgs(1),
@@ -33,7 +39,7 @@ You need at least T (threshold) valid horcruxes to succeed.`,
 			sourceDir = args[0]
 		}
 
-		// 2. Gather .horcrux files
+		// 2. Gather files
 		files, err := os.ReadDir(sourceDir)
 		if err != nil {
 			return fmt.Errorf("failed to read directory: %w", err)
@@ -44,16 +50,21 @@ You need at least T (threshold) valid horcruxes to succeed.`,
 			Path   string
 			Header *format.Header
 			Body   io.Reader
-			File   *os.File
+			File   *os.File // Kept open for standard files, nil for images
 		}
 
-		// Group files by an ID (Filename + Timestamp) to handle multiple split files in one dir
+		// Group files by an ID (Filename + Timestamp)
 		groups := make(map[string][]*loadedHorcrux)
 
 		fmt.Printf("Scanning for horcruxes in %s...\n", sourceDir)
 
 		for _, f := range files {
-			if f.IsDir() || filepath.Ext(f.Name()) != ".horcrux" {
+			if f.IsDir() {
+				continue
+			}
+
+			ext := strings.ToLower(filepath.Ext(f.Name()))
+			if ext != ".horcrux" && ext != ".png" {
 				continue
 			}
 
@@ -64,27 +75,52 @@ You need at least T (threshold) valid horcruxes to succeed.`,
 				continue
 			}
 
-			// We don't defer close here immediately because we need the Reader open for the pipeline.
-			// We will close them after processing the group.
+			var inputReader io.Reader
+			var fileToKeepOpen *os.File
+
+			if ext == ".png" {
+				// --- STEGANOGRAPHY HANDLING ---
+				img, _, err := image.Decode(file)
+				file.Close() // Close image file immediately after decoding
+				if err != nil {
+					fmt.Printf("Skipping invalid image %s: %v\n", f.Name(), err)
+					continue
+				}
+
+				hiddenData, err := stego.Extract(img)
+				if err != nil {
+					if err != stego.ErrNoHiddenData {
+						fmt.Printf("Failed to extract data from %s: %v\n", f.Name(), err)
+					}
+					continue
+				}
+
+				inputReader = bytes.NewReader(hiddenData)
+				fileToKeepOpen = nil
+
+			} else {
+				// --- STANDARD HANDLING ---
+				inputReader = file
+				fileToKeepOpen = file
+			}
 
 			// 3. Parse Header
-			reader, err := format.NewReader(file)
+			reader, err := format.NewReader(inputReader)
 			if err != nil {
-				// If header parsing fails, it might be a corrupted file or a "headerless" one.
-				// For now, we skip it as we cannot bind without metadata.
 				fmt.Printf("Skipping invalid/headerless file %s: %v\n", f.Name(), err)
-				file.Close()
+				if fileToKeepOpen != nil {
+					fileToKeepOpen.Close()
+				}
 				continue
 			}
 
-			// Create a unique group ID
 			groupID := fmt.Sprintf("%s|%d", reader.Header.OriginalFilename, reader.Header.Timestamp)
-			
+
 			lh := &loadedHorcrux{
 				Path:   path,
 				Header: reader.Header,
-				Body:   reader.Body, // This is the bufio reader positioned at the start of ciphertext
-				File:   file,
+				Body:   reader.Body,
+				File:   fileToKeepOpen,
 			}
 			groups[groupID] = append(groups[groupID], lh)
 		}
@@ -95,18 +131,17 @@ You need at least T (threshold) valid horcruxes to succeed.`,
 
 		// 4. Process Each Group
 		for _, group := range groups {
-			// All headers in a group should be identical regarding Total/Threshold
 			refHeader := group[0].Header
 			fmt.Printf("\nFound shards for: %s (Threshold: %d/%d)\n", refHeader.OriginalFilename, len(group), refHeader.Threshold)
 
-			// Clean up file handles for this group when done
 			defer func(gh []*loadedHorcrux) {
 				for _, h := range gh {
-					h.File.Close()
+					if h.File != nil {
+						h.File.Close()
+					}
 				}
 			}(group)
 
-			// Check Threshold
 			if len(group) < refHeader.Threshold {
 				fmt.Printf("Not enough horcruxes to restore %s. Need %d, found %d.\n", refHeader.OriginalFilename, refHeader.Threshold, len(group))
 				continue
@@ -129,17 +164,16 @@ You need at least T (threshold) valid horcruxes to succeed.`,
 			fmt.Println("Joining shards and decrypting...")
 			shardMap := make(map[int][]byte)
 			for _, h := range group {
-				// Read the binary body from the pre-positioned reader
 				data, err := io.ReadAll(h.Body)
 				if err != nil {
 					fmt.Printf("Failed to read body of %s: %v\n", h.Path, err)
-					// We might still succeed if we have enough other shards, but simpler to fail fast here
 					return err
 				}
-				shardMap[h.Header.Index] = data
+				// CRITICAL FIX: Convert 1-based Horcrux Index to 0-based RS Index
+				// Shamir uses 1..N, ReedSolomon uses 0..N-1
+				shardMap[h.Header.Index-1] = data
 			}
 
-			// Pipeline: Unshard -> Decrypt -> Decompress
 			plainText, err := pipeline.JoinPipeline(shardMap, key, refHeader.Total, refHeader.Threshold)
 			if err != nil {
 				fmt.Printf("Reconstruction pipeline failed: %v\n(Did you try to bind corrupted or wrong files?)\n", err)
@@ -149,11 +183,9 @@ You need at least T (threshold) valid horcruxes to succeed.`,
 			// 7. Write Output
 			finalPath := filepath.Join(outDir, refHeader.OriginalFilename)
 			if outDir == "" {
-				// Default to current directory if no output flag set
 				finalPath = refHeader.OriginalFilename
 			}
 
-			// Check overwrite
 			if _, err := os.Stat(finalPath); err == nil && !overwrite {
 				fmt.Printf("File %s already exists. Use --overwrite to replace it.\n", finalPath)
 				continue
