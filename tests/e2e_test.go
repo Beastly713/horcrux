@@ -29,8 +29,8 @@ func TestFullRoundTrip(t *testing.T) {
 	originalHash := sha256.Sum256(originalContent)
 
 	// 2. Execute SPLIT Command
-	root := cmd.GetRootCmd() 
-	
+	root := cmd.GetRootCmd()
+
 	// We will manually invoke the split logic via CLI args
 	splitArgs := []string{"split", originalFile, "-n", "5", "-t", "3", "-d", tmpDir}
 	root.SetArgs(splitArgs)
@@ -43,8 +43,10 @@ func TestFullRoundTrip(t *testing.T) {
 	assert.Equal(t, 5, len(matches), "Should have created 5 horcrux files")
 
 	// 4. Simulate Disaster: Delete 2 files (since threshold is 3, we can lose 2)
+	// Note: We need to be careful with indexing if glob returns unordered list,
+	// but generally removing any 2 is fine for the threshold test.
 	os.Remove(matches[0])
-	os.Remove(matches[3])
+	os.Remove(matches[1])
 
 	// 5. Execute BIND Command
 	bindArgs := []string{"bind", tmpDir, "--destination", tmpDir}
@@ -81,9 +83,10 @@ func TestHeaderlessRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 
 	// 2. Verify files look like noise
-	matches, _ := filepath.Glob(filepath.Join(tmpDir, "*.horcrux"))
-	require.NotEmpty(t, matches)
-	
+	// FIX: Headerless mode produces .bin files, not .horcrux
+	matches, _ := filepath.Glob(filepath.Join(tmpDir, "*.bin"))
+	require.NotEmpty(t, matches, "Should find .bin files for headerless mode")
+
 	content, _ := os.ReadFile(matches[0])
 	if bytes.Contains(content, []byte("THIS FILE IS A HORCRUX")) {
 		t.Fatal("Headerless mode failed: Found magic header in file")
