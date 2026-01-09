@@ -43,10 +43,11 @@ func TestFullRoundTrip(t *testing.T) {
 	assert.Equal(t, 5, len(matches), "Should have created 5 horcrux files")
 
 	// 4. Simulate Disaster: Delete 2 files (since threshold is 3, we can lose 2)
-	// Note: We need to be careful with indexing if glob returns unordered list,
-	// but generally removing any 2 is fine for the threshold test.
 	os.Remove(matches[0])
 	os.Remove(matches[1])
+
+	// FIX: Delete the original file so Bind is forced to reconstruct it
+	os.Remove(originalFile)
 
 	// 5. Execute BIND Command
 	bindArgs := []string{"bind", tmpDir, "--destination", tmpDir}
@@ -68,22 +69,87 @@ func TestFullRoundTrip(t *testing.T) {
 	}
 }
 
-// Helper to handle headerless mode
-func TestHeaderlessRoundTrip(t *testing.T) {
+// TestCorruptShard_Safety ensures that modified/corrupted shards cause the bind to fail
+// (protecting the user from getting a bad file) rather than silently succeeding.
+func TestCorruptShard_Safety(t *testing.T) {
 	tmpDir := t.TempDir()
-	originalFile := filepath.Join(tmpDir, "paranoiac.txt")
-	originalContent := []byte("This is a secret message for headerless mode")
+	originalFile := filepath.Join(tmpDir, "codes.txt")
+	originalContent := []byte("Launch codes: 12345")
 	os.WriteFile(originalFile, originalContent, 0644)
 
 	root := cmd.GetRootCmd()
 
-	// 1. Split with --headerless
-	root.SetArgs([]string{"split", originalFile, "-n", "3", "-t", "2", "-d", tmpDir, "--headerless"})
-	err := root.Execute()
+	// 1. SPLIT (3 shards, threshold 2)
+	root.SetArgs([]string{"split", originalFile, "-n", "3", "-t", "2", "-d", tmpDir})
+	require.NoError(t, root.Execute())
+
+	matches, _ := filepath.Glob(filepath.Join(tmpDir, "*.horcrux"))
+	require.Len(t, matches, 3)
+
+	// CRITICAL FIX: Delete the original file so Bind actually attempts restoration
+	os.Remove(originalFile)
+
+	// 2. CORRUPT One Shard
+	// We append garbage to the end of the file. 
+	// Since AES-GCM validates the authentication tag against the data, 
+	// changing the data length or content will invalidate the tag.
+	f, err := os.OpenFile(matches[0], os.O_APPEND|os.O_WRONLY, 0644)
+	require.NoError(t, err)
+	f.Write([]byte("MALICIOUS_DATA"))
+	f.Close()
+
+	// 3. BIND (Should FAIL or Skip Corrupt Shard)
+	// Scenario: We have 3 shards total. 1 is corrupt. Threshold is 2.
+	// The Bind logic gathers all 3. It should try to reconstruct. 
+	// The AES-GCM check on the corrupted shard will fail.
+	root.SetArgs([]string{"bind", tmpDir, "--destination", tmpDir})
+	err = root.Execute()
+	
+	// 4. VERIFY FAILURE (Security Check)
+	restoredFile := filepath.Join(tmpDir, "codes.txt")
+	
+	// If the file exists, it MUST match original content (meaning it ignored the bad shard and used the 2 good ones).
+	// If the file does not exist, that is also acceptable (failed safe).
+	// What is NOT acceptable is a file existing with garbage content.
+	if _, err := os.Stat(restoredFile); err == nil {
+		content, _ := os.ReadFile(restoredFile)
+		if bytes.Equal(content, originalContent) {
+			t.Log("Success: System automatically recovered using the remaining good shards.")
+		} else {
+			t.Fatalf("Security Fail: Bind created a corrupted file! Integrity check bypassed.")
+		}
+	} else {
+		t.Log("Success: System refused to output corrupted data.")
+	}
+
+	// 5. RECOVERY (Remove corrupt shard explicitly)
+	os.Remove(matches[0]) // Delete the bad one
+	
+	// Now we have 2 valid shards (Threshold is 2). Bind should succeed now.
+	root.SetArgs([]string{"bind", tmpDir, "--destination", tmpDir})
+	err = root.Execute()
 	require.NoError(t, err)
 
+	content, err := os.ReadFile(restoredFile)
+	require.NoError(t, err)
+	assert.Equal(t, originalContent, content, "Should recover perfectly using valid shards")
+}
+
+// TestHeaderlessRoundTrip verifies the --paranoiac flag behavior
+func TestHeaderlessRoundTrip(t *testing.T) {
+	tmpDir := t.TempDir()
+	originalFile := filepath.Join(tmpDir, "paranoiac.txt")
+	originalContent := []byte("Headerless secret")
+	os.WriteFile(originalFile, originalContent, 0644)
+
+	root := cmd.GetRootCmd()
+
+	// 1. Split --headerless
+	root.SetArgs([]string{"split", originalFile, "-n", "3", "-t", "2", "-d", tmpDir, "--headerless"})
+	require.NoError(t, root.Execute())
+
 	// 2. Verify files look like noise
-	// FIX: Headerless mode produces .bin files, not .horcrux
+	// Headerless mode produces .bin files, not .horcrux
 	matches, _ := filepath.Glob(filepath.Join(tmpDir, "*.bin"))
 	require.NotEmpty(t, matches, "Should find .bin files for headerless mode")
 
